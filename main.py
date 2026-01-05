@@ -28,7 +28,9 @@ all_words = re.split(r"(--\s|[.,!;:?_()\[\]\-]|\s+)", raw_text)
 
 # test the functionality of the byte_pair encoding... 
 bpe_tokenizer=bpe_tokenizer.BytePairEncoding()
-text="Hello, do you like tea? <|endoftext|> In the sunlit terraces of someunknownPlace."
+text="Hello, Ramesh do you like tea? <|endoftext|> In the sunlit terraces of someunknownPlace. in a winter season"
 
 bpe_ids=bpe_tokenizer.encode(text)
 print("your bpe_ide's are",bpe_ids)
+actual_string=bpe_tokenizer.decode(bpe_ids)
+print("actual string",actual_string)
