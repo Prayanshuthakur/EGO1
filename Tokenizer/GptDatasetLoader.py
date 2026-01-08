@@ -1,18 +1,24 @@
-from token import tok_name
-from .bpe_tokenization import BytePairEncoding
+from .bpe_tokenizer import BytePairEncoding
 import torch
 from torch.utils.data import Dataset,DataLoader
+
 class GptDataset(Dataset):
-    def __init__(self,text,max_lenght,stride) -> None:
+    def __init__(self, text, max_length, stride, tokenizer=None) -> None:
         self.input_ids=[]
         self.target_ids=[] 
-        bpe_tokenizer=BytePairEncoding()
+        
+        # Use provided tokenizer or create new one (for backward compatibility if needed, though injection is preferred)
+        if tokenizer is None:
+            bpe_tokenizer = BytePairEncoding()
+        else:
+            bpe_tokenizer = tokenizer
 
-        token_ids=bpe_tokenizer.encode(text) 
+        token_ids = bpe_tokenizer.encode(text) 
+        
         # now implement the sliding window approach to make the things done 
-        for i in range (0,len(token_ids)-max_lenght,stride):
-            context=token_ids[i:i+max_lenght]
-            target=token_ids[i+1:i+max_lenght+1]
+        for i in range(0, len(token_ids) - max_length, stride):
+            context = token_ids[i : i + max_length]
+            target = token_ids[i + 1 : i + max_length + 1]
             self.input_ids.append(torch.tensor(context))
             # print("context tensor is ",torch.tensor(context))
             self.target_ids.append(torch.tensor(target))
@@ -24,12 +30,12 @@ class GptDataset(Dataset):
     def __getitem__(self,idx):
         return self.input_ids[idx],self.target_ids[idx]
 
-def create_dataloader(txt,batch_size=4,max_length=256,stride=128,suffle=True,drop_last=True,num_workers=0):
-    dataset=GptDataset(txt,max_length,stride)
-    dataset_loader=DataLoader(
+def create_dataloader(txt, batch_size=4, max_length=256, stride=128, shuffle=True, drop_last=True, num_workers=0, tokenizer=None):
+    dataset = GptDataset(txt, max_length, stride, tokenizer)
+    dataset_loader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=suffle,
+        shuffle=shuffle,
         drop_last=drop_last,
         num_workers=num_workers
     )
