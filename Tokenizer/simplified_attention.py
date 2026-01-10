@@ -18,22 +18,29 @@ def attention_for_single_word():
 )
     query=inputs[1]
     attention_scores=torch.empty(inputs.shape[0])
-    for i,i_x in enumerate(inputs):
-        torch_value=torch.dot(i_x,query)
-        attention_scores[i]=torch_value
-    print("your attension score is ",attention_scores)
-
+    # for i,i_x in enumerate(inputs):
+    #     torch_value=torch.dot(i_x,query)
+    #     print("your torch value is ",torch_value)
+    #     attention_scores[i]=torch_value
+    # print("your attension score is ",attention_scores)
+    # here technically we are doing the metric calculation of the query and the transpose of the inputs
+    direct_calculation_attention_scores=query@inputs.T
+    print("your direct calculation is ",direct_calculation_attention_scores)
     # now we have to do normalize the attention scores and there are two ways to do so 
     # one is the naive way and the other is the efficient way 
     def naive_soft_max(x):
         return torch.exp(x)/torch.exp(x).sum(dim=0)
-    naive_softmax_weights=naive_soft_max(attention_scores)
+    naive_softmax_weights=naive_soft_max(direct_calculation_attention_scores)
     # print("your naive soft max is ",naive_softmax_weights)
-    actual_softmax_weights=torch.softmax(attention_scores,dim=0)
-    # print("your actual soft max is ",actual_softmax_weights)
+    attention_weights=torch.softmax(direct_calculation_attention_scores,dim=0)
+    print("your actual soft max is ",attention_weights)
     context_vector=torch.zeros(query.shape)
     for ind,emb_vector in enumerate(inputs):
-        context_vector+=emb_vector*actual_softmax_weights[ind]
+        each_row_vector=emb_vector*attention_weights[ind]
+        print("your each row vector is ",each_row_vector)
+        context_vector+=emb_vector*attention_weights[ind]
+    direct_calculation_context_vector=attention_weights@inputs
+    print("your direct calculation context vector is ",direct_calculation_context_vector)
     print("your final context vector is ",context_vector)
     return context_vector
 
@@ -52,10 +59,11 @@ def attention_for_entire_sentence():
         [0.05, 0.80, 0.55]         # step
     ]
 )
-    attention_scores=inputs@inputs.T
+    attention_scores= inputs@inputs.T # in the single word calculation we were doing the query*inputs.T but as we have multiple queries(which is again the inputs we are directly multiplying this)
     # print("your attension score is ",attention_scores)
     attention_weights=torch.softmax(attention_scores,dim=1)
-    # print("your attention weights is ",attention_weights)
+
+    print("your attention weights is ",attention_weights)
     # now calculate the context vectors
     context_vector=attention_weights@inputs
     print("your context vector is ",context_vector)
