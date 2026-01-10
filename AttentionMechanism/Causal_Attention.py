@@ -55,13 +55,13 @@ class CausalAttention(nn.Module):
         scores = scores / (K.shape[-1] ** 0.5)
 
         mask = self.mask[:T, :T]
-        print("your mask is ",mask)
+        # print("your mask is ",mask)
         scores = scores.masked_fill(mask.bool(), -float("inf"))
-        print("your scores is ",scores)
+        # print("your scores is ",scores)
         weights = torch.softmax(scores, dim=-1)
-        print("your weights is ",weights)
+        # print("your weights is ",weights)
         weights = self.dropout(weights)
-        print("your weights after dropout is ",weights)
+        # print("your weights after dropout is ",weights)
         context = weights @ V
         return context
 
