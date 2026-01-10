@@ -15,7 +15,6 @@ class CausalAttention(nn.Module):
             qkv_bias (bool, optional): Whether to use bias in the query, key, and value projections. Defaults to False.
         """
         super().__init__()
-        super().__init__()
         self.w_query = nn.Linear(d_in, d_out, bias=qkv_bias)
         self.w_key   = nn.Linear(d_in, d_out, bias=qkv_bias)
         self.w_value = nn.Linear(d_in, d_out, bias=qkv_bias)
