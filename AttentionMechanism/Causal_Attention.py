@@ -15,7 +15,7 @@ class CausalAttention(nn.Module):
             qkv_bias (bool, optional): Whether to use bias in the query, key, and value projections. Defaults to False.
         """
         super().__init__()
-        self.w_query = nn.Linear(d_in, d_out, bias=qkv_bias)
+        self.w_query = nn.Linear(d_in, d_out, bias=qkv_bias) # this will create a linear layer with d_in input features and d_out output features
         self.w_key   = nn.Linear(d_in, d_out, bias=qkv_bias)
         self.w_value = nn.Linear(d_in, d_out, bias=qkv_bias)
         self.dropout = nn.Dropout(dropout)
@@ -47,9 +47,9 @@ class CausalAttention(nn.Module):
         """
         B, T, _ = inputs.shape
         
-        Q = self.w_query(inputs)
-        K = self.w_key(inputs)
-        V = self.w_value(inputs)
+        Q = self.w_query(inputs)  #Q=XWqT​+b
+        K = self.w_key(inputs)    #K=XWKT​+b
+        V = self.w_value(inputs)  #V=XWVT​+b
 
         scores = Q @ K.transpose(1, 2)
         scores = scores / (K.shape[-1] ** 0.5)
