@@ -89,7 +89,7 @@ class EngineAttention(nn.Module):
         # Computes similarity between all token pairs per head.
         # Result shape: (B, H, T, T)
         # -------------------------------------------------------------
-        attn_scores = (q @ k.transpose(-2, -1)) * self.scale
+        attn_scores = (q @ k.transpose(-2, -1)) * self.scale  # scaled dot product
 
         # -------------------------------------------------------------
         # Step 5: Apply Causal Bias
