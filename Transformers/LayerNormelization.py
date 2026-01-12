@@ -25,7 +25,8 @@ inputs=torch.tensor(
         [0.05, 0.80, 0.55]         # step
     ]
 )
+batch=torch.stack([inputs,inputs],dim=0)
 d_in=inputs.shape[1]
 layer_norm=LayerNorm(d_in)
-context_vector=layer_norm(inputs)
+context_vector=layer_norm(batch)
 print("your layer norm context vector is ",context_vector)
