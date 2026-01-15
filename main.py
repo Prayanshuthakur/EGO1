@@ -1,7 +1,7 @@
 import torch
 from Tokenizer import sample_tokenizer, bpe_tokenizer # Renamed import
 import re
-from Tokenizer.GptDatasetLoader import create_dataloader
+from Tokenizer.EgoDatasetLoader import create_dataloader
 
 def read_text(file_name):
     with open(file_name, "r", encoding="utf-8") as f:
