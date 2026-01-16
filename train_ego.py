@@ -95,6 +95,7 @@ def train_model():
 
     # 5. Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.1)
+    
 
     # 6. Training Loop Configuration
     num_epochs = 1

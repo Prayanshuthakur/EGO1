@@ -4,6 +4,9 @@ from config.ego_config import EGO_CONFIG_124M
 from Tokenizer.bpe_tokenizer import BytePairEncoding
 import torch
 
+
+
+
 def text_to_token_ids(text):
     tokenizer=BytePairEncoding()
     encoded=tokenizer.encode(text)
@@ -32,10 +35,26 @@ EGO_CONFIG_124M={
 }
 print("your batch shape is",batch.shape)
 model=EgoModel(EGO_CONFIG_124M)
+model.load_state_dict(torch.load("ego_model.pt"))   
+model.eval()
 output=generate_text_simple(model,batch,20,128)
 print(output.shape)
 # i don't want to include the input tokens in the output
 print(output[:,batch.shape[1]:])
 # now decode the ids to text 
+
+# now i want to print the output text
+
+
+
+
+
 output_text=token_ids_to_text(output[:,batch.shape[1]:])
 print(output_text)
+
+
+
+
+
+
+
