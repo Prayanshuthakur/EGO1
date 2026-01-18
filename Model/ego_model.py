@@ -31,7 +31,7 @@ from Model.transformer_block import TransformerBlock
 
 class EgoModel(nn.Module):
     """
-    Ego Model
+    Ego - A GPT-2 Style Language Model (Production Ready).
     
     A decoder-only transformer for autoregressive language modeling.
     Given a sequence of token IDs, the model predicts the probability
@@ -63,103 +63,127 @@ class EgoModel(nn.Module):
             - n_heads (int): Number of attention heads per block
             - drop_rate (float): Dropout probability
             - qkv_bias (bool): Whether to use bias in attention
-    
+            
     Example:
-        >>> cfg = {
-        ...     "vocab_size": 50257, "context_length": 1024,
-        ...     "emb_dim": 768, "n_layers": 12, "n_heads": 12,
-        ...     "drop_rate": 0.1, "qkv_bias": False
-        ... }
-        >>> model = EgoModel(cfg)
-        >>> input_ids = torch.randint(0, 50257, (2, 512))
+        >>> model = EgoModel(EGO_CONFIG_45M)
         >>> logits = model(input_ids)
-        >>> print(logits.shape)  # torch.Size([2, 512, 50257])
     """
     
     def __init__(self, cfg: dict):
         super().__init__()
         
-        # --------------------------------------------------
-        # Embedding Layers
-        # --------------------------------------------------
-        # Token embedding: maps vocabulary indices to vectors
-        self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"])
+        self.cfg = cfg
+        # ----------------------------------------------------------------
+        # 1. Embeddings (The Input Layer)
+        # ----------------------------------------------------------------
+        # Token Embeddings: Converts integer token IDs (0-50k) into dense vectors (512-dim).
+        # Variable: self.token_embedding
+        self.token_embedding = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"])
         
-        # Positional embedding: encodes position in sequence
-        self.pos_emb = nn.Embedding(cfg["context_length"], cfg["emb_dim"])
+        # Positional Embeddings: Learns a unique vector for each position (0-511)
+        # to give the model a sense of order/sequence not provided by self-attention.
+        # Variable: self.position_embedding
+        self.position_embedding = nn.Embedding(cfg["context_length"], cfg["emb_dim"])
         
-        # Dropout applied after combining embeddings
-        self.drop_emb = nn.Dropout(cfg["drop_rate"])
+        # Dropout: Randomly zeros out elements to prevent overfitting during training.
+        self.dropout = nn.Dropout(cfg["drop_rate"])
         
-        # --------------------------------------------------
-        # Transformer Blocks
-        # --------------------------------------------------
-        # Stack of N transformer blocks
-        self.trf_blocks = nn.Sequential(
-            *[TransformerBlock(cfg) for _ in range(cfg["n_layers"])]
+        # ----------------------------------------------------------------
+        # 2. Key Architecture Components (The "Hidden" Layers)
+        # ----------------------------------------------------------------
+        # Transformer Blocks: The core sequential processing units.
+        # We store them in a ModuleList so PyTorch can track them properly.
+        # Variable: self.transformer_blocks (formerly 'h')
+        self.transformer_blocks = nn.ModuleList(
+            [TransformerBlock(cfg) for _ in range(cfg["n_layers"])]
         )
         
-        # --------------------------------------------------
-        # Output Layers
-        # --------------------------------------------------
-        # Final layer normalization
-        self.final_norm = LayerNorm(cfg["emb_dim"])
+        # ----------------------------------------------------------------
+        # 3. Output Stage (The "Head")
+        # ----------------------------------------------------------------
+        # Final Layer Norm: Stabilizes the activations before the final prediction.
+        # Variable: self.final_layer_norm (formerly 'ln_f')
+        self.final_layer_norm = LayerNorm(cfg["emb_dim"])
         
-        # Output projection to vocabulary (no bias as per GPT-2)
-        self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
+        # Language Model Head: Projects the 512-dim vectors back to 50k vocabulary size
+        # to predict the probability of the next token.
+        # Variable: self.lm_head
+        self.lm_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
+        
+        # Weight Tying: We reuse the token embedding weights for the output head.
+        # This is a standard practice in GPT models to reduce parameters and improve performance.
+        self.lm_head.weight = self.token_embedding.weight
+        
+        # Initialize weights according to GPT-2 best practices
+        self.apply(self._init_weights)
+        
+        # Apply special scaled initialization for residual projections
+        # This keeps the variance constant as network depth increases
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight') or pn.endswith('fc2.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / (2 * cfg["n_layers"]) ** 0.5)
+
+    def _init_weights(self, module):
+        """
+        Custom weight initialization based on the GPT-2 paper.
+        - Linear layers: Normal distribution (mean=0, std=0.02)
+        - Embeddings: Normal distribution (mean=0, std=0.02)
+        - Biases: All zeros
+        """
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, in_idx: torch.Tensor) -> torch.Tensor:
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None) -> torch.Tensor:
         """
-        Forward pass through the Ego model.
-        
-        Args:
-            in_idx (torch.Tensor): Input token IDs of shape (batch_size, seq_len)
-                                   Values should be in range [0, vocab_size)
-        
-        Returns:
-            torch.Tensor: Logits over vocabulary of shape (batch_size, seq_len, vocab_size)
-                         Apply softmax for probabilities, argmax for predictions.
-        
-        Processing Steps:
-            1. Look up token embeddings from embedding table
-            2. Add positional embeddings (absolute position encoding)
-            3. Apply dropout for regularization
-            4. Pass through stack of transformer blocks
-            5. Apply final layer normalization
-            6. Project to vocabulary size for next-token prediction
+        The main Forward Pass (Input -> Output) function.
         """
-        batch_size, seq_len = in_idx.shape
+        B, T = idx.shape # Batch size, Sequence Length
         
-        # Step 1: Token embeddings
-        # (B, T) -> (B, T, emb_dim)
-        tok_embeds = self.tok_emb(in_idx)
+        # 1. Embeddings: Get the vectors for tokens and positions
+        tok_emb = self.token_embedding(idx)
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        pos_emb = self.position_embedding(pos)
         
-        # Step 2: Positional embeddings
-        # Create position indices [0, 1, 2, ..., seq_len-1]
-        # and look up their embeddings
-        pos_indices = torch.arange(seq_len, device=in_idx.device)
-        pos_embeds = self.pos_emb(pos_indices)  # (T, emb_dim)
+        # Combine and apply input dropout
+        x = self.dropout(tok_emb + pos_emb)
         
-        # Step 3: Combine embeddings
-        # pos_embeds broadcasts across batch dimension
-        x = tok_embeds + pos_embeds  # (B, T, emb_dim)
-        x = self.drop_emb(x)
+        # 2. Process through all Transformer Blocks sequentially
+        for block in self.transformer_blocks:
+            x = block(x)
         
-        # Step 4: Transformer blocks
-        x = self.trf_blocks(x)  # (B, T, emb_dim)
+        # 3. Final normalization
+        x = self.final_layer_norm(x)
         
-        # Step 5: Final normalization
-        x = self.final_norm(x)  # (B, T, emb_dim)
+        # 4. Project to vocabulary (calculate Logits)
+        logits = self.lm_head(x)
         
-        # Step 6: Output projection
-        logits = self.out_head(x)  # (B, T, vocab_size)
+        # 5. Calculate Loss (if training)
+        loss = None
+        if targets is not None:
+            # Flatten the logits and targets to match CrossEntropyLoss expectations
+            loss = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         
-        return logits
+        return (logits, loss) if loss is not None else logits
     
     def count_parameters(self) -> int:
-        """Count the total number of trainable parameters."""
-        return sum(p.numel() for p in self.parameters())
-    
-    def get_memory_footprint_mb(self) -> float:
-        """Estimate memory footprint in MB (assuming float32)."""
-        return self.count_parameters() * 4 / (1024 * 1024)
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    @torch.no_grad()
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: int = None):
+        for _ in range(max_new_tokens):
+            idx_cond = idx if idx.size(1) <= self.cfg["context_length"] else idx[:, -self.cfg["context_length"]:]
+            logits = self(idx_cond)
+            logits = logits[:, -1, :] / temperature
+            
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            
+            probs = nn.functional.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+        return idx

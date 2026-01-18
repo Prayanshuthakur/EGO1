@@ -1,3 +1,5 @@
 tiktoken==0.6.0
 torch
 numpy
+huggingface_hub 
+transformers

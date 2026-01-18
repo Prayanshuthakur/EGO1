@@ -2,7 +2,23 @@ from .bpe_tokenizer import BytePairEncoding
 import torch
 from torch.utils.data import Dataset,DataLoader
 
-class EgoDataset(Dataset):
+class SlidingWindowDataset(Dataset):
+    """
+    Sliding Window Dataset for Autoregressive Training.
+    
+    This dataset converts a long text (sequence of integers) into many training samples.
+    
+    Mechanism: "Sliding Window"
+    We take a window of size `max_length` + 1 from the text.
+    - Input: The first `max_length` tokens.
+    - Target: The shifted version (offset by 1), predicting the next token.
+    
+    Args:
+        text (str): The full training corpus string.
+        max_length (int): Context length (how many tokens the model sees).
+        stride (int): How much to move the window for the next sample.
+        tokenizer: Instance of BPETokenizer (defaults to BytePairEncoding).
+    """
     def __init__(self, text, max_length, stride, tokenizer=None) -> None:
         self.input_ids=[]
         self.target_ids=[] 
@@ -13,12 +29,17 @@ class EgoDataset(Dataset):
         else:
             bpe_tokenizer = tokenizer
         
+        # Convert full text to integer tokens
         token_ids = bpe_tokenizer.encode(text) 
         
-        # Sliding window approach
+        # Sliding window approach to create (context, target) pairs
         for i in range(0, len(token_ids) - max_length, stride):
+            # Input (Context): Tokens [i : i + max_length]
             context = token_ids[i : i + max_length]
+            
+            # Target (Prediction): Tokens [i+1 : i + max_length + 1]
             target = token_ids[i + 1 : i + max_length + 1]
+            
             self.input_ids.append(context)
             self.target_ids.append(target)
         
@@ -31,7 +52,12 @@ class EgoDataset(Dataset):
         )
 
 def create_dataloader(txt, batch_size=4, max_length=256, stride=128, shuffle=True, drop_last=True, num_workers=0, tokenizer=None):
-    dataset = EgoDataset(txt, max_length, stride, tokenizer)
+    """
+    Helper function to create a PyTorch DataLoader.
+    
+    Wraps the SlidingWindowDataset in a standard DataLoader for batching and shuffling.
+    """
+    dataset = SlidingWindowDataset(txt, max_length, stride, tokenizer)
     dataset_loader = DataLoader(
         dataset,
         batch_size=batch_size,

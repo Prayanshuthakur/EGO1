@@ -56,8 +56,18 @@ class TransformerBlock(nn.Module):
     def __init__(self, cfg: dict):
         super().__init__()
         
-        # Multi-Head Self-Attention
-        self.att = MultiHeadAttention(
+        # ----------------------------------------------------------------
+        # 1. Attention Sub-Block
+        # ----------------------------------------------------------------
+        # Layer Norm 1: Applied BEFORE attention (Pre-Norm architecture)
+        # We normalize the input features to stabilize training.
+        # Variable: self.pre_attention_norm
+        self.pre_attention_norm = LayerNorm(cfg["emb_dim"])
+        
+        # Self-Attention: Mixing information between tokens.
+        # This allows the model to capture dependencies between distant words.
+        # Variable: self.self_attention
+        self.self_attention = MultiHeadAttention(
             d_in=cfg["emb_dim"],
             d_out=cfg["emb_dim"],
             context_length=cfg["context_length"],
@@ -66,50 +76,45 @@ class TransformerBlock(nn.Module):
             qkv_bias=cfg["qkv_bias"]
         )
         
-        # Position-wise FeedForward Network
-        self.ff = FeedForward(cfg)
+        # ----------------------------------------------------------------
+        # 2. Feed-Forward Sub-Block
+        # ----------------------------------------------------------------
+        # Layer Norm 2: Applied BEFORE the Feed Forward Network
+        # Normalizes the output of the attention block + residual.
+        # Variable: self.pre_ffn_norm
+        self.pre_ffn_norm = LayerNorm(cfg["emb_dim"])
         
-        # Layer Normalization (Pre-LayerNorm style)
-        self.norm1 = LayerNorm(cfg["emb_dim"])
-        self.norm2 = LayerNorm(cfg["emb_dim"])
-        
-        # Dropout for residual connections
-        self.drop_shortcut = nn.Dropout(cfg["drop_rate"])
+        # Feed-Forward Network: Processing information independently per token.
+        # This layer extracts higher-level features from the attended information.
+        # Variable: self.feed_forward
+        self.feed_forward = FeedForward(cfg)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass through the transformer block.
+        Processing Flow of a Transformer Block:
         
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch, seq_len, emb_dim)
-        
-        Returns:
-            torch.Tensor: Output tensor of shape (batch, seq_len, emb_dim)
-        
-        Processing Flow:
-            1. Store input for residual connection
-            2. Apply LayerNorm → Attention → Dropout
-            3. Add residual (input + output)
-            4. Store for second residual
-            5. Apply LayerNorm → FeedForward → Dropout
-            6. Add residual (previous + output)
+        1. Attention Path:
+           Input -> Norm -> Attention -> Add to Input (Residual)
+           
+        2. Feed-Forward Path:
+           Resid Output -> Norm -> FeedForward -> Add to Previous (Residual)
         """
-        # ============================================
-        # Attention Sub-Layer with Residual Connection
-        # ============================================
-        shortcut = x
-        x = self.norm1(x)                    # Pre-LayerNorm
-        x = self.att(x)                      # Multi-Head Attention
-        x = self.drop_shortcut(x)            # Dropout
-        x = x + shortcut                     # Residual Connection
+        # ----------------------------------------------------------------
+        # 1. Self-Attention with Residual Connection
+        # ----------------------------------------------------------------
+        # x = x + Attention(Norm(x))
+        residual = x
+        normalized_x = self.pre_attention_norm(x)
+        attention_output = self.self_attention(normalized_x)
+        x = residual + attention_output
         
-        # ============================================
-        # FeedForward Sub-Layer with Residual Connection
-        # ============================================
-        shortcut = x
-        x = self.norm2(x)                    # Pre-LayerNorm
-        x = self.ff(x)                       # FeedForward
-        x = self.drop_shortcut(x)            # Dropout
-        x = x + shortcut                     # Residual Connection
+        # ----------------------------------------------------------------
+        # 2. Feed-Forward Network with Residual Connection
+        # ----------------------------------------------------------------
+        # x = x + FeedForward(Norm(x))
+        residual = x # we also call it as shortcut connection
+        normalized_x = self.pre_ffn_norm(x)
+        ffn_output = self.feed_forward(normalized_x)
+        x = residual + ffn_output # we also call it as residual connection
         
         return x

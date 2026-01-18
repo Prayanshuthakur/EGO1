@@ -37,8 +37,9 @@ class LayerNorm(nn.Module):
     
     def __init__(self, emb_dim: int):
         super().__init__()
-        self.eps = 1e-5
-        self.scale = nn.Parameter(torch.ones(emb_dim))   # gamma
+        self.eps = 1e-5 # small constant for numerical stability to avoid division by zero
+        # gamma and beta are learnable parameters
+        self.scale = nn.Parameter(torch.ones(emb_dim))   # gamma 
         self.shift = nn.Parameter(torch.zeros(emb_dim))  # beta
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -54,6 +55,10 @@ class LayerNorm(nn.Module):
         mean = x.mean(dim=-1, keepdim=True)
         var = x.var(dim=-1, keepdim=True, unbiased=False)
         norm_x = (x - mean) / torch.sqrt(var + self.eps)
+        """
+        here the reason for multiplication with gamma 
+        and addition with beta is to allow the model to learn the optimal scaling and shifting for each feature
+        """
         return self.scale * norm_x + self.shift
 
 
@@ -64,13 +69,10 @@ class GELU(nn.Module):
     GELU is a smooth, non-linear activation function used in GPT-2 and BERT.
     Unlike ReLU, GELU allows small negative values, which helps with gradient flow.
     
-    This implementation uses the approximate formula from the GPT-2 paper:
-        GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+    Formula:
+        GELU(x) = x * P(X <= x) where X ~ N(0, 1)
     
-    Properties:
-        - Smooth (differentiable everywhere)
-        - Non-monotonic for negative values
-        - Approximates ReLU for large positive values
+    This implementation uses the approximate tanh formula from the GPT-2 paper for efficiency.
     """
     
     def __init__(self):
@@ -78,14 +80,10 @@ class GELU(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Apply GELU activation.
-        
-        Args:
-            x (torch.Tensor): Input tensor of any shape.
-        
-        Returns:
-            torch.Tensor: Activated tensor of same shape as input.
+        Apply the GELU activation function.
         """
+        # 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        # This approximation is faster to compute than the exact error function (erf)
         return 0.5 * x * (1 + torch.tanh(
             torch.sqrt(torch.tensor(2.0 / torch.pi)) *
             (x + 0.044715 * torch.pow(x, 3))
@@ -94,38 +92,54 @@ class GELU(nn.Module):
 
 class FeedForward(nn.Module):
     """
-    Position-wise Feedforward Network
+    Position-wise Feedforward Network (FFN)
     
-    A two-layer MLP with GELU activation, applied independently to each position.
-    The hidden dimension is typically 4x the embedding dimension (expansion factor).
+    This component processes each token independently in parallel. It increases the 
+    dimensionality (expansion) to learn complex features and then projects it back.
     
-    Architecture:
-        Linear(emb_dim -> 4*emb_dim) -> GELU -> Linear(4*emb_dim -> emb_dim)
-    
-    This layer enables the model to learn complex feature transformations
-    after the attention mechanism has aggregated contextual information.
-    
-    Args:
-        cfg (dict): Configuration dictionary containing:
-            - emb_dim (int): The embedding dimension.
+    The standard expansion factor is 4x the embedding dimension.
     """
     
     def __init__(self, cfg: dict):
         super().__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(cfg["emb_dim"], 4 * cfg["emb_dim"]),
-            GELU(),
-            nn.Linear(4 * cfg["emb_dim"], cfg["emb_dim"]),
-        )
+        
+        # ----------------------------------------------------------------
+        # 1. Expansion Layer
+        # ----------------------------------------------------------------
+        # Projects from emb_dim -> 4 * emb_dim
+        # Allows the model to map the input to a higher-dimensional space for feature extraction.
+        # Variable: self.expansion_layer (formerly fc1/c_fc)
+        self.expansion_layer = nn.Linear(cfg["emb_dim"], 4 * cfg["emb_dim"])
+        
+        # ----------------------------------------------------------------
+        # 2. Activation Function
+        # ----------------------------------------------------------------
+        # Introduces non-linearity to the network.
+        self.activation = GELU()
+        
+        # ----------------------------------------------------------------
+        # 3. Projection Layer (Contraction)
+        # ----------------------------------------------------------------
+        # Projects from 4 * emb_dim -> emb_dim
+        # Compresses the features back to the model's internal width.
+        # Variable: self.loss_projection_layer (formerly fc2/c_proj) -- wait, simply 'output_projection'
+        self.output_projection = nn.Linear(4 * cfg["emb_dim"], cfg["emb_dim"])
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Apply feedforward transformation.
+        Forward pass of the FeedForward Network.
         
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch, seq_len, emb_dim)
-        
-        Returns:
-            torch.Tensor: Output tensor of shape (batch, seq_len, emb_dim)
+        Step 1: Expand dimensions (Linear)
+        Step 2: Apply non-linearity (GELU)
+        Step 3: Project back to original dimensions (Linear)
         """
-        return self.layers(x)
+        # Step 1: Expansion
+        x = self.expansion_layer(x)
+        
+        # Step 2: Activation
+        x = self.activation(x)
+        
+        # Step 3: Projection
+        x = self.output_projection(x)
+        
+        return x

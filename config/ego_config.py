@@ -16,3 +16,14 @@ EGO_CONFIG_124M = {
     "drop_rate": 0.1,         # Dropout rate
     "qkv_bias": False         # No bias in QKV projections (GPT-2 style)
 }
+
+# Ego-45M parameter configuration (Production / H200 Optimized)
+EGO_CONFIG_45M = {
+    "vocab_size": 50257,
+    "context_length": 512,
+    "emb_dim": 512,
+    "n_heads": 8,
+    "n_layers": 6,
+    "drop_rate": 0.0,
+    "qkv_bias": False
+}

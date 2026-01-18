@@ -66,19 +66,35 @@ class MultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = d_out // num_heads
         
-        # Query, Key, Value projections
-        self.W_query = nn.Linear(d_in, d_out, bias=qkv_bias)
-        self.W_key = nn.Linear(d_in, d_out, bias=qkv_bias)
-        self.W_value = nn.Linear(d_in, d_out, bias=qkv_bias)
+        # ----------------------------------------------------------------
+        # 1. QKV Projection Layer (Fused)
+        # ----------------------------------------------------------------
+        # Projects input to Query, Key, and Value vectors simultaneously.
+        # Shape: d_in -> 3 * d_out
+        # Variable: self.qkv_projection (formerly c_attn)
+        self.qkv_projection = nn.Linear(d_in, 3 * d_out, bias=qkv_bias)
         
-        # Output projection to mix head outputs
-        self.out_proj = nn.Linear(d_out, d_out)
+        # ----------------------------------------------------------------
+        # 2. Output Projection Layer
+        # ----------------------------------------------------------------
+        # Projects the concatenated head outputs back to the original dimension.
+        # Shape: d_out -> d_out
+        # Variable: self.output_projection (formerly c_proj)
+        self.output_projection = nn.Linear(d_out, d_out)
         
-        # Dropout layers
-        self.dropout = nn.Dropout(dropout)
+        # ----------------------------------------------------------------
+        # 3. Regularization
+        # ----------------------------------------------------------------
+        # Dropout applied to attention scores (probabilities)
+        self.attention_dropout = nn.Dropout(dropout)
+        # Dropout applied to the final output (residual path)
+        self.residual_dropout = nn.Dropout(dropout)
         
-        # Causal mask: upper triangular matrix of ones
-        # Will be filled with -inf to mask future tokens
+        # ----------------------------------------------------------------
+        # 4. Causal Mask
+        # ----------------------------------------------------------------
+        # Upper triangular matrix used to mask future tokens during self-attention.
+        # This ensures the model is autoregressive (can't see the future).
         self.register_buffer(
             "mask",
             torch.triu(torch.ones(context_length, context_length), diagonal=1)
@@ -86,7 +102,7 @@ class MultiHeadAttention(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass of multi-head attention.
+        Forward pass of multi-head attention (Fused Implementation).
         
         Args:
             x (torch.Tensor): Input tensor of shape (batch, seq_len, d_in)
@@ -95,52 +111,78 @@ class MultiHeadAttention(nn.Module):
             torch.Tensor: Output tensor of shape (batch, seq_len, d_out)
         
         Computation Flow:
-            1. Project inputs to Q, K, V vectors
-            2. Reshape to separate attention heads
+            1. Project inputs to Q, K, V vectors (Fused for speed)
+            2. Split and Reshape to separate attention heads
             3. Compute scaled dot-product attention scores
-            4. Apply causal mask
+            4. Apply causal mask (block future tokens)
             5. Normalize with softmax
             6. Apply dropout
-            7. Compute weighted sum of values
+            7. Compute weighted sum of values (Attention)
             8. Merge heads and project output
         """
-        B, T, _ = x.shape
+        B, T, C = x.shape
         
-        # Step 1: Linear projections
-        # Shape: (B, T, d_out)
-        keys = self.W_key(x)
-        queries = self.W_query(x)
-        values = self.W_value(x)
+        # ----------------------------------------------------------------
+        # Step 1: Fused Linear Projection
+        # ----------------------------------------------------------------
+        # Project input to combined Q, K, V
+        # Shape: (B, T, 3 * d_out)
+        qkv = self.qkv_projection(x)
         
+        # Split into Query, Key, Value
+        q, k, v = qkv.split(self.d_out, dim=2)
+        
+        # ----------------------------------------------------------------
         # Step 2: Reshape for multi-head attention
-        # (B, T, d_out) -> (B, T, num_heads, head_dim) -> (B, num_heads, T, head_dim)
-        keys = keys.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        queries = queries.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        values = values.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        # ----------------------------------------------------------------
+        # Transform from (Batch, Seq, Dim) to (Batch, Heads, Seq, Head_Dim)
+        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         
+        # ----------------------------------------------------------------
         # Step 3: Scaled dot-product attention scores
-        # (B, H, T, D) @ (B, H, D, T) -> (B, H, T, T)
-        attn_scores = queries @ keys.transpose(-2, -1)
+        # ----------------------------------------------------------------
+        # Dot product of Queries and Keys
+        # Scale by 1/sqrt(head_dim) to keep gradients stable
+        # Shape: (B, H, T, T)
+        attn_scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
         
-        # Step 4: Apply causal mask (set future positions to -inf)
+        # ----------------------------------------------------------------
+        # Step 4: Apply causal mask
+        # ----------------------------------------------------------------
+        # Fill future positions with negative infinity so softmax makes them zero
         mask_bool = self.mask.bool()[:T, :T]
-        attn_scores.masked_fill_(mask_bool, -torch.inf)
+        attn_scores.masked_fill_(mask_bool, -float('inf'))
         
-        # Step 5: Scale and normalize
-        attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1)
+        # ----------------------------------------------------------------
+        # Step 5: Softmax and dropout
+        # ----------------------------------------------------------------
+        # Convert scores to probabilities
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        # Apply dropout to the attention weights
+        attn_weights = self.attention_dropout(attn_weights)
         
-        # Step 6: Apply dropout
-        attn_weights = self.dropout(attn_weights)
+        # ----------------------------------------------------------------
+        # Step 6: Aggregate values
+        # ----------------------------------------------------------------
+        # Weighted sum of Value vectors
+        # Shape: (B, H, T, Head_Dim)
+        y = attn_weights @ v 
         
-        # Step 7: Weighted sum of values
-        # (B, H, T, T) @ (B, H, T, D) -> (B, H, T, D)
-        context_vec = attn_weights @ values
+        # ----------------------------------------------------------------
+        # Step 7: Merge heads
+        # ----------------------------------------------------------------
+        # Concatenate all heads back together
+        # Shape: (B, T, H, Head_Dim) -> (B, T, d_out)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         
-        # Step 8: Merge heads
-        # (B, H, T, D) -> (B, T, H, D) -> (B, T, d_out)
-        context_vec = context_vec.transpose(1, 2).contiguous().view(B, T, self.d_out)
+        # ----------------------------------------------------------------
+        # Step 8: Output projection and residual dropout
+        # ----------------------------------------------------------------
+        # Project back to embedding dimension and apply dropout
+        y = self.residual_dropout(self.output_projection(y))
         
-        # Step 9: Output projection
-        context_vec = self.out_proj(context_vec)
-        
-        return context_vec
+        return y
+
+
