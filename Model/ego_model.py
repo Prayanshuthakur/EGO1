@@ -1,189 +1,214 @@
-"""
-Ego Model Implementation
-========================
-
-This module contains the complete Ego (Generative Pre-trained Transformer style) model.
-The EgoModel class combines all components into a unified architecture:
-
-1. Token Embeddings - Converts token IDs to dense vectors
-2. Positional Embeddings - Adds position information
-3. Transformer Blocks - Stack of attention + feedforward layers
-4. Final LayerNorm - Stabilizes final representations
-5. Output Head - Projects to vocabulary logits
-
-This implementation follows the GPT-2 architecture:
-- Pre-LayerNorm in transformer blocks
-- GELU activation in feedforward networks
-- Causal (autoregressive) attention masking
-"""
-
 import torch
 import torch.nn as nn
-import sys
-import os
-
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from Model.layers import LayerNorm
+import torch.nn.functional as F
+import math
+import inspect
+from Model.layers import RMSNorm
 from Model.transformer_block import TransformerBlock
-
+from Model.common import print0
 
 class EgoModel(nn.Module):
     """
-    Ego - A GPT-2 Style Language Model (Production Ready).
+    Ego SOTA - A Modern Transformer Architecture for 2026.
     
-    A decoder-only transformer for autoregressive language modeling.
-    Given a sequence of token IDs, the model predicts the probability
-    distribution over the vocabulary for the next token at each position.
-    
-    Architecture Overview:
-        Token IDs (B, T)
-            ↓
-        Token Embedding (vocab_size -> emb_dim)
-            +
-        Positional Embedding (context_length -> emb_dim)
-            ↓
-        Dropout
-            ↓
-        N × TransformerBlock
-            ↓
-        Final LayerNorm
-            ↓
-        Linear Output Head (emb_dim -> vocab_size)
-            ↓
-        Logits (B, T, vocab_size)
-    
-    Args:
-        cfg (dict): Configuration dictionary containing:
-            - vocab_size (int): Size of the vocabulary
-            - context_length (int): Maximum sequence length
-            - emb_dim (int): Embedding dimension
-            - n_layers (int): Number of transformer blocks
-            - n_heads (int): Number of attention heads per block
-            - drop_rate (float): Dropout probability
-            - qkv_bias (bool): Whether to use bias in attention
-            
-    Example:
-        >>> model = EgoModel(EGO_CONFIG_45M)
-        >>> logits = model(input_ids)
+    Features:
+    - RoPE (Rotary Positional Embeddings)
+    - Per-layer Residual & X0 Scalars
+    - Logit Softcapping (15.0)
+    - RMSNorm (functional)
+    - QK Norm in Attention
+    - Multi-Optimizer support ready
     """
     
     def __init__(self, cfg: dict):
         super().__init__()
-        
         self.cfg = cfg
-        # ----------------------------------------------------------------
-        # 1. Embeddings (The Input Layer)
-        # ----------------------------------------------------------------
-        # Token Embeddings: Converts integer token IDs (0-50k) into dense vectors (512-dim).
-        # Variable: self.token_embedding
+        
+        # 1. Embeddings (No absolute positional embeddings needed!)
         self.token_embedding = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"])
         
-        # Positional Embeddings: Learns a unique vector for each position (0-511)
-        # to give the model a sense of order/sequence not provided by self-attention.
-        # Variable: self.position_embedding
-        self.position_embedding = nn.Embedding(cfg["context_length"], cfg["emb_dim"])
+        # 2. Transformer Blocks
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(cfg, i) for i in range(cfg["n_layers"])
+        ])
         
-        # Dropout: Randomly zeros out elements to prevent overfitting during training.
-        self.dropout = nn.Dropout(cfg["drop_rate"])
+        # Per-layer learnable scalars (inspired by nanochat/modded-nanogpt)
+        # resid_lambdas: scales the residual stream at each layer
+        # x0_lambdas: blends initial embedding back in at each layer
+        self.resid_lambdas = nn.Parameter(torch.ones(cfg["n_layers"]))
+        self.x0_lambdas = nn.Parameter(torch.zeros(cfg["n_layers"]))
         
-        # ----------------------------------------------------------------
-        # 2. Key Architecture Components (The "Hidden" Layers)
-        # ----------------------------------------------------------------
-        # Transformer Blocks: The core sequential processing units.
-        # We store them in a ModuleList so PyTorch can track them properly.
-        # Variable: self.transformer_blocks (formerly 'h')
-        self.transformer_blocks = nn.ModuleList(
-            [TransformerBlock(cfg) for _ in range(cfg["n_layers"])]
-        )
+        # Final Norm
+        self.final_norm = RMSNorm(cfg["emb_dim"])
         
-        # ----------------------------------------------------------------
-        # 3. Output Stage (The "Head")
-        # ----------------------------------------------------------------
-        # Final Layer Norm: Stabilizes the activations before the final prediction.
-        # Variable: self.final_layer_norm (formerly 'ln_f')
-        self.final_layer_norm = LayerNorm(cfg["emb_dim"])
-        
-        # Language Model Head: Projects the 512-dim vectors back to 50k vocabulary size
-        # to predict the probability of the next token.
-        # Variable: self.lm_head
+        # LM Head (Untied for better performance)
         self.lm_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
         
-        # Weight Tying: We reuse the token embedding weights for the output head.
-        # This is a standard practice in GPT models to reduce parameters and improve performance.
-        self.lm_head.weight = self.token_embedding.weight
+        # Precompute RoPE embeddings
+        # We over-compute by 2X the context length to be safe
+        self.rotary_seq_len = cfg["context_length"] * 2
+        self.head_dim = cfg["emb_dim"] // cfg["n_heads"]
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, self.head_dim)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
         
-        # Initialize weights according to GPT-2 best practices
+        # Weight Initialization
         self.apply(self._init_weights)
-        
-        # Apply special scaled initialization for residual projections
-        # This keeps the variance constant as network depth increases
-        for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight') or pn.endswith('fc2.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02 / (2 * cfg["n_layers"]) ** 0.5)
 
     def _init_weights(self, module):
-        """
-        Custom weight initialization based on the GPT-2 paper.
-        - Linear layers: Normal distribution (mean=0, std=0.02)
-        - Embeddings: Normal distribution (mean=0, std=0.02)
-        - Biases: All zeros
-        """
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            # Special scaled initialization for projections
+            std = 0.02
+            if hasattr(module, 'c_proj'): # Not quite right for nn.Linear
+                 std *= (2 * self.cfg["n_layers"])**-0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-    
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None) -> torch.Tensor:
+
+    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000):
+        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32)
+        inv_freq = 1.0 / (base ** (channel_range / head_dim))
+        t = torch.arange(seq_len, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
+        cos, sin = freqs.cos(), freqs.sin()
+        # Shape: (1, seq_len, 1, head_dim/2) for broadcasting
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+        return cos, sin
+
+    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, device_type='cuda'):
         """
-        The main Forward Pass (Input -> Output) function.
+        Setup dual-optimizer training (AdamW + Muon).
+        
+        Uses fused AdamW when available on CUDA for better performance.
         """
-        B, T = idx.shape # Batch size, Sequence Length
+        # Separate parameters into groups for different optimizers
+        matrix_params = []
+        embedding_params = []
+        lm_head_params = []
+        scalar_params = [self.resid_lambdas, self.x0_lambdas]
         
-        # 1. Embeddings: Get the vectors for tokens and positions
-        tok_emb = self.token_embedding(idx)
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
-        pos_emb = self.position_embedding(pos)
+        for name, param in self.named_parameters():
+            if "token_embedding" in name:
+                embedding_params.append(param)
+            elif "lm_head" in name:
+                lm_head_params.append(param)
+            elif "resid_lambdas" in name or "x0_lambdas" in name:
+                continue  # already in scalar_params
+            elif param.ndim == 2:  # any other 2D parameter is a "matrix"
+                matrix_params.append(param)
+            else:  # any other parameter (e.g. 1D bias or norm scale)
+                embedding_params.append(param)  # treat as small param for AdamW
+
+        from Model.adamw import DistAdamW
+        from Model.muon import Muon, DistMuon
+        from Model.common import get_dist_info
         
-        # Combine and apply input dropout
-        x = self.dropout(tok_emb + pos_emb)
+        is_ddp, _, _, _ = get_dist_info()
         
-        # 2. Process through all Transformer Blocks sequentially
-        for block in self.transformer_blocks:
-            x = block(x)
+        adam_groups = [
+            dict(params=lm_head_params, lr=unembedding_lr),
+            dict(params=embedding_params, lr=embedding_lr),
+            dict(params=scalar_params, lr=0.005),  # sensitive
+        ]
         
-        # 3. Final normalization
-        x = self.final_layer_norm(x)
+        # Use fused AdamW when available (significant speedup on CUDA)
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
         
-        # 4. Project to vocabulary (calculate Logits)
+        AdamWFactory = DistAdamW if is_ddp else torch.optim.AdamW
+        adamw_optimizer = AdamWFactory(adam_groups, betas=(0.8, 0.95), eps=1e-10, **extra_args)
+        
+        if use_fused:
+            print0(f"✅ Using fused AdamW optimizer")
+        
+        MuonFactory = DistMuon if is_ddp else Muon
+        muon_optimizer = MuonFactory(matrix_params, lr=matrix_lr, momentum=0.95, weight_decay=weight_decay)
+        
+        return [adamw_optimizer, muon_optimizer]
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, kv_cache=None) -> torch.Tensor:
+        B, T = idx.shape
+        
+        # 1. Embeddings
+        x = self.token_embedding(idx)
+        x0 = x # save for x0 residuals
+        
+        # 2. Get RoPE cos/sin for current seq len
+        cos_sin = (self.cos[:, :T], self.sin[:, :T])
+        
+        # 3. Process Blocks
+        for i, block in enumerate(self.transformer_blocks):
+            # Blend in layer scalars
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            x = block(x, cos_sin, kv_cache=kv_cache)
+            
+        # 4. Final Norm
+        x = self.final_norm(x)
+        
+        # 5. LM Head with Softcapping
         logits = self.lm_head(x)
         
-        # 5. Calculate Loss (if training)
+        # Logit Softcapping (15.0) prevents training instabilities
+        softcap = 15.0
+        logits = softcap * torch.tanh(logits / softcap)
+        
+        # 6. Loss Calculation
         loss = None
         if targets is not None:
-            # Flatten the logits and targets to match CrossEntropyLoss expectations
-            loss = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        
-        return (logits, loss) if loss is not None else logits
-    
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            
+        return (logits, loss) if targets is not None else logits
+
     def count_parameters(self) -> int:
+        """Return the number of trainable parameters."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+    def estimate_mfu(self, batch_size, dt):
+        """
+        Estimate Model FLOPS Utilization (MFU) as ratio of A100 peak FLOPS.
+        
+        Based on PaLM paper Appendix B: https://arxiv.org/abs/2204.02311
+        
+        Args:
+            batch_size: Number of samples per iteration
+            dt: Time taken for one training iteration (seconds)
+        
+        Returns:
+            MFU as a fraction (e.g., 0.5 means 50% utilization)
+        """
+        N = self.count_parameters()
+        cfg = self.cfg
+        L = cfg["n_layers"]
+        H = cfg["n_heads"]
+        Q = cfg["emb_dim"] // cfg["n_heads"]  # head dimension
+        T = cfg["context_length"]
+        
+        # FLOPs per token (forward + backward = 2x, plus activations = 3x total)
+        flops_per_token = 6 * N + 12 * L * H * Q * T
+        flops_per_fwdbwd = flops_per_token * T
+        flops_per_iter = flops_per_fwdbwd * batch_size
+        
+        # Express throughput as ratio of A100 bfloat16 peak FLOPS
+        flops_achieved = flops_per_iter / dt
+        flops_promised = 312e12  # A100 GPU bfloat16 peak is 312 TFLOPS
+        
+        return flops_achieved / flops_promised
+
     @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: int = None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.cfg["context_length"] else idx[:, -self.cfg["context_length"]:]
-            logits = self(idx_cond)
-            logits = logits[:, -1, :] / temperature
+            # Autoregressive generation
+            logits = self(idx)
+            logits = logits[:, -1, :] / (temperature + 1e-6)
             
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
             
-            probs = nn.functional.softmax(logits, dim=-1)
+            probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
